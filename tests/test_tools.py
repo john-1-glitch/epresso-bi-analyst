@@ -66,7 +66,10 @@ def test_revenue_by_year(model):
     assert r.value['by_year'] == {'2025': 450, '2026': 550}
     assert r.value['change_first_to_last_pct'] == 22.22  # (550 - 450) / 450
     one_store = analytics.revenue_by_year(model, store='B')  # only 2026
-    assert one_store.value == {'by_year': {'2026': 150}, 'change_first_to_last_pct': None}
+    assert one_store.value['by_year'] == {'2026': 150}
+    assert one_store.value['change_first_to_last_pct'] is None
+    assert r.value['best_year'] == {'year': 2026, 'revenue': 550}
+    assert r.value['worst_year'] == {'year': 2025, 'revenue': 450}
 
 
 def test_revenue_by_category_for_2025(model):
@@ -247,3 +250,33 @@ def test_access_database_upload_fills_three_tables():
     assert data['errors'] == []
     assert set(data['tables']) == {'sales', 'stores', 'categories', 'products'}
     assert len(data['model']) == 25200
+
+
+def test_monthly_revenue_share(model):
+    r = analytics.monthly_revenue_share(model)
+    # January = S1 100 + S4 200 = 300 (30%); December = 300 + 50 + 150 + 200 = 700 (70%)
+    assert r.value['by_month']['Jan'] == {'revenue': 300, 'share': 0.3}
+    assert r.value['by_month']['Dec'] == {'revenue': 700, 'share': 0.7}
+    assert r.value['by_month']['Jun'] == {'revenue': 0, 'share': 0.0}
+    assert len(r.value['by_month']) == 12
+    assert r.value['best_month'] == {'month': 'Dec', 'revenue': 700}
+    assert any('summed over every year' in c for c in r.caveats)
+    website_2025 = analytics.monthly_revenue_share(model, year=2025, channel='Website')
+    assert website_2025.value['best_month'] == {'month': 'Dec', 'revenue': 300}  # S2
+
+
+@pytest.mark.parametrize('question, expected', [
+    ('What was the best year?', ('revenue_by_year', {})),
+    ('What was our worst year for the website?', ('revenue_by_year', {'channel': 'Website'})),
+    ('Which year had the highest revenue in Denver?', ('revenue_by_year', {'store': 'Denver'})),
+    ('Which month brings in the most revenue?', ('monthly_revenue_share', {})),
+    ('Is December our strongest month in 2026?', ('monthly_revenue_share', {'year': 2026})),
+    ('How did 2026 do?', ('total_revenue', {'year': 2026})),
+])
+def test_rules_router_for_best_year_and_months(model, question, expected):
+    assert agent.rules_router(question, model) == expected
+
+
+def test_best_year_answer_names_the_year(model):
+    out = agent.answer_question('What was the best year?', model)
+    assert 'Best year: 2026 ($550.00); weakest: 2025 ($450.00).' in out['findings']

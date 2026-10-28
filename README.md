@@ -57,7 +57,8 @@ We built **Option A, a live language-model agent** using Google Gemini with func
 | Tool | What it calculates | Arguments |
 |---|---|---|
 | `total_revenue` | Revenue in scope and its share of all revenue | year, channel, store |
-| `revenue_by_year` | Revenue for each year and the change from first to last year | channel, store |
+| `revenue_by_year` | Revenue for each year, the best and worst year, and the change from first to last year | channel, store |
+| `monthly_revenue_share` | Revenue and share for each calendar month, with the strongest and weakest month | year, channel, store |
 | `revenue_by_category` | Revenue and share for each product category | year, channel, store |
 | `revenue_by_channel` | Revenue and share for Website vs Brick & Mortar | year, store |
 | `top_stores` | The n stores with the most revenue, with shares | year, channel, n |
@@ -82,7 +83,7 @@ Full evidence: [`docs/validation.md`](docs/validation.md) (Power BI table, indep
 
 **$1,000 test.** Adding $1,000 to Sales row S0020250101 and uploading the copy in the same session raised the total to exactly $42,175,440. The Website 2025 chart point, the January bar, the Beans bar and the 2025 + Website filter each rose by $1,000, while Brick & Mortar, 2026 and store SH01 did not change. The assistant's answer moved by $1,000. There were no code changes and no restart, because the cache is keyed on each file's contents.
 
-**Automated tests.** 83 tests in `tests/` run on a six-row dataset whose answers are worked out by hand in the test file. They cover totals, merge checks (including a duplicated store key and an unknown store), missing columns, Excel header detection and Access upload, filters, every assistant tool, the dispatcher, both routers, the number check, the backup model and the Gemini fallback (with a fake client, so the tests run offline).
+**Automated tests.** 91 tests in `tests/` run on a six-row dataset whose answers are worked out by hand in the test file. They cover totals, merge checks (including a duplicated store key and an unknown store), missing columns, Excel header detection and Access upload, filters, every assistant tool, the dispatcher, both routers, the number check, the backup model and the Gemini fallback (with a fake client, so the tests run offline).
 
 ## Limitations
 
