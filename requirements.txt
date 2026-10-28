@@ -3,3 +3,4 @@ pandas>=2.0
 plotly>=5.20
 openpyxl>=3.1
 google-genai>=1.47
+access-parser>=0.0.6

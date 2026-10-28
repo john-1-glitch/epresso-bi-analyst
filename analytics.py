@@ -2,8 +2,10 @@
 tested on its own and reused by the assistant."""
 from __future__ import annotations
 
+import functools
 import io
 import logging
+import tempfile
 from dataclasses import asdict, dataclass, field
 
 import pandas as pd
@@ -12,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 EXCEL_EXT = ('.xlsx', '.xlsm', '.xls')
 TEXT_EXT = ('.csv', '.txt', '.tsv')
+ACCESS_EXT = ('.accdb', '.mdb')
 
 # Columns each uploaded table must have. Any other columns in the file are kept.
 REQUIRED_COLUMNS = {
@@ -49,6 +52,33 @@ def load_table(file_bytes: bytes, filename: str, sheet_name=0) -> pd.DataFrame:
     raise ValueError(f'Unsupported file type: {filename}')
 
 
+@functools.lru_cache(maxsize=4)
+def _access_tables(file_bytes: bytes) -> dict:
+    """Every user table in an Access database, read once per distinct file contents."""
+    from access_parser import AccessParser
+
+    with tempfile.NamedTemporaryFile(suffix='.accdb') as tmp:
+        tmp.write(file_bytes)
+        tmp.flush()
+        db = AccessParser(tmp.name)
+    return {name: pd.DataFrame(db.parse_table(name)) for name in db.catalog
+            if not name.startswith(('MSys', 'f_'))}  # skip system and attachment tables
+
+
+def _candidate_tables(file_bytes: bytes, filename: str):
+    """Yield every table in an upload: each sheet of a workbook, each table of an
+    Access database, or the single table in a CSV / text file."""
+    name = filename.lower()
+    if name.endswith(ACCESS_EXT):
+        for df in _access_tables(file_bytes).values():
+            yield df.copy()
+    elif name.endswith(EXCEL_EXT):
+        for sheet in excel_sheet_names(file_bytes):
+            yield load_table(file_bytes, filename, sheet)
+    else:
+        yield load_table(file_bytes, filename)
+
+
 def missing_columns(df: pd.DataFrame, role: str) -> list[str]:
     return [c for c in REQUIRED_COLUMNS[role] if c not in df.columns]
 
@@ -68,16 +98,15 @@ def _promote_header(df: pd.DataFrame, required: list[str], max_scan: int = 10) -
 
 
 def load_role_table(file_bytes: bytes, filename: str, role: str):
-    """Load the upload for one table (sales, stores, ...). For Excel, use the first sheet
-    that has the required columns. Returns (df, None), or (None, a readable message
-    naming the missing columns) so the app never shows a traceback."""
+    """Load the upload for one table (sales, stores, ...). For an Excel workbook or an
+    Access database, use the first sheet / table that has the required columns.
+    Returns (df, None), or (None, a readable message naming the missing columns)
+    so the app never shows a traceback."""
     required = REQUIRED_COLUMNS[role]
     label = TABLE_INFO[role][0]
     best_missing = required
     try:
-        sheets = excel_sheet_names(file_bytes) if filename.lower().endswith(EXCEL_EXT) else [0]
-        for sheet in sheets:
-            df = load_table(file_bytes, filename, sheet)
+        for df in _candidate_tables(file_bytes, filename):
             df.columns = [str(c).strip() for c in df.columns]
             df = _promote_header(df, required)
             missing = missing_columns(df, role)
@@ -295,6 +324,7 @@ def build_dataset(uploads) -> dict:
     """`uploads` is an iterable of (role, filename, file_bytes). Loads, validates and
     cleans each table, then builds the joined sales model. Pure function (no Streamlit),
     so the app can cache it on the file contents. 'errors' holds messages for the UI."""
+    uploads = list(uploads)
     tables, sources, errors = {}, {}, []
     for role, filename, file_bytes in uploads:
         df, err = load_role_table(file_bytes, filename, role)
@@ -302,8 +332,22 @@ def build_dataset(uploads) -> dict:
             errors.append(err)
         else:
             tables[role], sources[role] = df, filename
+    # An Access database holds several tables (Sales, Categories, Products), so one
+    # upload can fill every role that was not uploaded separately.
+    access_files = [(f, b) for _, f, b in uploads if f.lower().endswith(ACCESS_EXT)]
+    for role in REQUIRED_COLUMNS:
+        for filename, file_bytes in access_files:
+            if role in tables:
+                break
+            df, err = load_role_table(file_bytes, filename, role)
+            if not err:
+                tables[role], sources[role] = df, f'{filename} (Access table)'
+    for role in REQUIRED_TABLES:
+        if role not in tables and not errors:
+            errors.append(f'No {TABLE_INFO[role][0]} table was found. Upload it, or upload '
+                          'an Access database that contains it.')
     result = {'tables': tables, 'sources': sources, 'errors': errors}
-    if errors or any(r not in tables for r in REQUIRED_TABLES):
+    if errors:
         return result
     tables['sales'], result['sales_issues'] = clean_sales(tables['sales'])
     if 'survey' in tables:
@@ -547,6 +591,129 @@ def top_stores(model: pd.DataFrame, year=None, channel=None, n=5) -> ToolResult:
         definition=('Sum of Revenue for each store, ranked highest first; share = store '
                     'revenue / revenue of all stores in scope.'),
         scope=scope, rows_used=int(subset['Revenue'].notna().sum()), caveats=_caveats(subset))
+
+
+def _resolve_years(model: pd.DataFrame, start_year=None, end_year=None):
+    """Default to the first and last year in the loaded data; reject unknown years."""
+    years = sorted(int(y) for y in model['Year'].dropna().unique())
+    try:
+        start = years[0] if start_year is None else int(str(start_year).strip())
+        end = years[-1] if end_year is None else int(str(end_year).strip())
+    except ValueError:
+        return None, None, f'Years must be numbers. Available years: {years}.'
+    for y in (start, end):
+        if y not in years:
+            return None, None, f'There are no sales for {y}. Available years: {years}.'
+    if start >= end:
+        return None, None, f'The start year ({start}) must be before the end year ({end}).'
+    return start, end, None
+
+
+def _change_rows(subset: pd.DataFrame, key: str, start: int, end: int, label=str) -> list:
+    """Revenue in the start and end year for each value of `key`, with the change."""
+    pivot = (subset[subset['Year'].isin([start, end])]
+             .pivot_table(index=key, columns='Year', values='Revenue', aggfunc='sum'))
+    rows = []
+    for k, r in pivot.iterrows():
+        before, after = r.get(start), r.get(end)
+        if pd.isna(before) or pd.isna(after) or before == 0:
+            continue  # only compare names present (and non-zero) in both years
+        rows.append({'name': label(k), 'start_revenue': round(float(before), 2),
+                     'end_revenue': round(float(after), 2),
+                     'change': round(float(after - before), 2),
+                     'change_pct': round(float((after - before) / before * 100), 2)})
+    return sorted(rows, key=lambda x: x['change_pct'])
+
+
+def revenue_change_by_store(model: pd.DataFrame, start_year=None, end_year=None,
+                            channel=None) -> ToolResult:
+    """Each store's revenue change between two years, with the largest decline and growth."""
+    name = 'revenue_change_by_store'
+    subset, scope, err = _resolve_scope(model, None, channel, None)
+    if err:
+        return _error(name, err, scope)
+    start, end, err = _resolve_years(model, start_year, end_year)
+    if err:
+        return _error(name, err, scope)
+    scope['year'] = f'{start} vs {end}'
+    labels = {s: store_label(s, c, loc) for s, c, loc in
+              zip(subset['Store ID'], subset['City'], subset['Location'])}
+    rows = _change_rows(subset, 'Store ID', start, end, label=lambda s: labels[s])
+    declined = [r for r in rows if r['change'] < 0]
+    caveats = _caveats(subset, 'A change over time shows what happened, not why it happened.')
+    if not declined:
+        caveats.append(f'No store had lower revenue in {end} than in {start}.')
+    missing = subset['Store ID'].nunique() - len(rows)
+    if missing:
+        caveats.append(f'{missing} store(s) without revenue in both years were left out.')
+    return ToolResult(
+        tool=name,
+        value={'start_year': start, 'end_year': end, 'stores': rows,
+               'largest_decline': declined[0] if declined else None,
+               'largest_growth': rows[-1] if rows and rows[-1]['change'] > 0 else None,
+               'stores_declined': len(declined), 'stores_compared': len(rows)},
+        definition=('For each store: revenue in the end year minus revenue in the start year; '
+                    'change % = that difference / start-year revenue x 100.'),
+        scope=scope, rows_used=int(subset['Year'].isin([start, end]).sum()), caveats=caveats)
+
+
+def revenue_change_by_channel(model: pd.DataFrame, start_year=None, end_year=None,
+                              store=None) -> ToolResult:
+    """Each channel's revenue change between two years, and which grew the most."""
+    name = 'revenue_change_by_channel'
+    subset, scope, err = _resolve_scope(model, None, None, store)
+    if err:
+        return _error(name, err, scope)
+    start, end, err = _resolve_years(model, start_year, end_year)
+    if err:
+        return _error(name, err, scope)
+    scope['year'] = f'{start} vs {end}'
+    rows = _change_rows(subset, 'StoreType', start, end)
+    return ToolResult(
+        tool=name,
+        value={'start_year': start, 'end_year': end, 'channels': rows,
+               'largest_growth': rows[-1] if rows else None},
+        definition=('For each channel (StoreType): revenue in the end year minus revenue in the '
+                    'start year; change % = that difference / start-year revenue x 100.'),
+        scope=scope, rows_used=int(subset['Year'].isin([start, end]).sum()),
+        caveats=_caveats(subset, 'A change over time shows what happened, not why it happened.'))
+
+
+def satisfaction_vs_revenue(model: pd.DataFrame, survey: pd.DataFrame = None,
+                            year=None) -> ToolResult:
+    """How store revenue and survey satisfaction move together, one point per store-year."""
+    name = 'satisfaction_vs_revenue'
+    if survey is None:
+        return _error(name, 'The Survey Results file is not loaded, so satisfaction cannot be '
+                            'analyzed. Upload it in the sidebar.')
+    subset, scope, err = _resolve_scope(model, year, None, None)
+    if err:
+        return _error(name, err, scope)
+    per_store_year = subset.groupby(['Store ID', 'Year'], as_index=False)['Revenue'].sum()
+    scores = survey[['Store ID', 'Year', 'Satisfaction']].dropna(subset=['Year'])
+    joined = per_store_year.merge(scores, on=['Store ID', 'Year'], how='inner')
+    blank = int(joined['Satisfaction'].isna().sum())
+    pairs = joined.dropna(subset=['Satisfaction'])
+    if len(pairs) < 3:
+        return _error(name, 'Fewer than three store-years have both revenue and a satisfaction '
+                            'score, so no relationship can be measured.', scope)
+    r = float(pairs['Satisfaction'].corr(pairs['Revenue']))
+    caveats = _caveats(subset,
+                       'Correlation is not causation: other factors (store size, market, '
+                       'location) can drive both satisfaction and revenue.',
+                       'Satisfaction is one annual survey score per store; it is not a '
+                       'measure of every customer.')
+    if blank:
+        caveats.append(f'{blank} store-year(s) had no satisfaction score (for example, the '
+                       'website is not surveyed) and were left out, not counted as zero.')
+    return ToolResult(
+        tool=name,
+        value={'correlation': round(r, 3), 'store_years_used': int(len(pairs)),
+               'store_years_without_score': blank,
+               'average_satisfaction': round(float(pairs['Satisfaction'].mean()), 2)},
+        definition=('Pearson correlation between each store-year\'s total revenue and its '
+                    'satisfaction score (0-5 scale), using only store-years with a score.'),
+        scope=scope, rows_used=int(len(subset)), caveats=caveats)
 
 
 def grain_table(tables: dict, sources: dict) -> pd.DataFrame:

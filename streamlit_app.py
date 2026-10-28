@@ -1,5 +1,6 @@
-"""Main app. Checkpoint 2: loads every E-Presso table, checks each join, and shows
-total revenue. Keep calculations in analytics.py and the assistant in agent.py."""
+"""Main app: loads the E-Presso tables, checks each join, shows revenue, a filtered
+dashboard and the analytical assistant. Calculations live in analytics.py and the
+assistant in agent.py."""
 import logging
 
 import pandas as pd
@@ -10,7 +11,7 @@ import agent
 import analytics
 
 MAX_QUESTIONS = 15  # per-session limit for the assistant
-FILE_TYPES = ['csv', 'txt', 'tsv', 'xlsx', 'xls']
+FILE_TYPES = ['csv', 'txt', 'tsv', 'xlsx', 'xls', 'accdb', 'mdb']
 
 logging.basicConfig(level=logging.INFO)  # merge checks are logged to the terminal
 
@@ -78,8 +79,10 @@ def table_view(df: pd.DataFrame, money_cols=('Revenue',), pct_cols=('Share',)):
 
 with st.sidebar:
     st.header('Data')
-    st.caption('Upload one file per table. For Excel files, the sheet with the right '
-               'columns is found automatically.')
+    st.caption('Upload one file per table: CSV, Excel or Access. In a workbook or Access '
+               'database, the sheet or table with the right columns is found automatically. '
+               'If you upload the Access database (Support_EX_B_Sales.accdb) as Sales, '
+               'Categories and Products are read from it too.')
     uploaded = {}
     for role in analytics.REQUIRED_COLUMNS:
         label = analytics.TABLE_INFO[role][0]
@@ -89,7 +92,9 @@ with st.sidebar:
         if file is not None:
             uploaded[role] = file
 
-waiting = [analytics.TABLE_INFO[r][0] for r in analytics.REQUIRED_TABLES if r not in uploaded]
+has_access = any(f.name.lower().endswith(analytics.ACCESS_EXT) for f in uploaded.values())
+waiting = [analytics.TABLE_INFO[r][0] for r in analytics.REQUIRED_TABLES
+           if r not in uploaded and not (has_access and r in ('categories', 'products'))]
 if waiting:
     st.info('Upload these tables in the sidebar to begin: ' + ', '.join(waiting) + '.')
     st.stop()
@@ -117,11 +122,13 @@ def render_dashboard():
 
     # Filters: one row above the charts. Empty means "all".
     f1, f2, f3, f4 = st.columns(4)
-    years = f1.multiselect('Year', options['years'], placeholder='All years')
-    channels = f2.multiselect('Channel', options['channels'], placeholder='All channels')
-    stores = f3.multiselect('Store', list(options['stores']), placeholder='All stores',
+    years = f1.multiselect('Year', options['years'], placeholder='All years', key='flt_year')
+    channels = f2.multiselect('Channel', options['channels'], placeholder='All channels',
+                              key='flt_channel')
+    stores = f3.multiselect('Store', list(options['stores']), placeholder='All stores', key='flt_store',
                             format_func=options['stores'].get)
-    categories = f4.multiselect('Category', options['categories'], placeholder='All categories')
+    categories = f4.multiselect('Category', options['categories'], placeholder='All categories',
+                                key='flt_category')
 
     view = analytics.filter_sales(model, years, channels, stores, categories)
     scope = ' · '.join([
@@ -258,12 +265,13 @@ with tab_dash:
 with tab_assistant:
     api_key = secret('GEMINI_API_KEY')
     gemini_model = secret('GEMINI_MODEL', agent.GEMINI_MODEL)
-    use_llm = bool(api_key) and st.toggle('Use Gemini to choose the tool', value=True)
+    use_llm = bool(api_key) and st.toggle('Use Gemini (language-model agent)', value=True)
     if use_llm:
-        st.caption(f'Mode: Gemini ({gemini_model}) chooses ONE approved analytical function through '
-                   'function calling. The answer is written by our code from that function\'s '
-                   'result, so every number comes from the data. If Gemini fails, the '
-                   'rules-based assistant answers instead.')
+        st.caption(f'Mode: Gemini ({gemini_model}) agent. Gemini chooses ONE approved analytical '
+                   'function through function calling, our code runs it on the loaded data, and '
+                   'Gemini explains the result. Any number in its explanation that is not in '
+                   'the tool result is caught and the standard answer is shown instead. If '
+                   'Gemini fails or its quota runs out, the rules-based assistant answers.')
     else:
         st.caption('Mode: rules-based assistant. Keyword rules choose one approved analytical '
                    'function; the numbers come only from that function.'
@@ -271,7 +279,18 @@ with tab_assistant:
     with st.expander('What can I ask?'):
         st.markdown(agent.CAN_ANSWER + '\n\nExamples: "What was total revenue in 2029?", '
                     '"Website revenue by year", "Revenue by category for SH09", '
-                    '"Top 3 stores in 2027", "Website vs brick and mortar in 2025".')
+                    '"Top 3 stores in 2027", "Which store had the greatest percentage revenue '
+                    'decline?", "Which sales channel grew the most?", "Does higher customer '
+                    'satisfaction cause higher revenue?", "Should E-Presso close its Chicago '
+                    'store?"')
+    active = {name: st.session_state.get(f'flt_{key}') for key, name in
+              (('year', 'Year'), ('channel', 'Channel'), ('store', 'Store'), ('category', 'Category'))}
+    active = {k: v for k, v in active.items() if v}
+    if active:
+        st.info('Your dashboard filters (' + '; '.join(f"{k}: {', '.join(map(str, v))}"
+                for k, v in active.items()) + ') do not apply here. The assistant answers from '
+                'the full loaded dataset; name a year, channel or store in your question to '
+                'narrow it.')
     st.session_state.setdefault('n_questions', 0)
     st.session_state.setdefault('history', [])
     st.caption(f"Questions used: {st.session_state['n_questions']} of {MAX_QUESTIONS}")
@@ -306,8 +325,9 @@ with tab_assistant:
                 except Exception:  # SDK missing or bad key format: answer_question falls back
                     client = None
                 answer = agent.answer_question(question, model, mode='llm', llm_client=client,
-                                               model=gemini_model)
+                                               model=gemini_model, survey=tables.get('survey'))
             else:
-                answer = agent.answer_question(question, model, mode='rules')
+                answer = agent.answer_question(question, model, mode='rules',
+                                               survey=tables.get('survey'))
             st.session_state['history'].append({'question': question, 'answer': answer})
             st.rerun()

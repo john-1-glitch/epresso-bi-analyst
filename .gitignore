@@ -13,3 +13,4 @@ data/exported/
 *.pbix
 .claude/
 .DS_Store
+data/modified/
