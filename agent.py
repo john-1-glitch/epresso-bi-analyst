@@ -3,20 +3,42 @@ The router (rules now, a language model later) only CHOOSES a tool and its
 arguments. Our code RUNS the tool. Nothing here executes model-written code."""
 from __future__ import annotations
 
+import logging
+import re
+from datetime import datetime, timezone
+
 import analytics
 from analytics import ToolResult
 
-# The ONLY things the assistant may do. Add your own tools here.
+logger = logging.getLogger(__name__)
+
+# The ONLY things the assistant may do. Each entry names the function and the
+# arguments it accepts; anything else is rejected by the dispatcher.
 TOOLS = {
-    'get_total': {
-        'fn': analytics.get_total,
-        'params': {'value_col', 'filters'},
-        'description': 'Sum a numeric column, optionally filtered.',
+    'total_revenue': {
+        'fn': analytics.total_revenue,
+        'params': {'year', 'channel', 'store'},
+        'description': 'Total revenue, optionally for one year, channel and/or store.',
     },
-    'group_total': {
-        'fn': analytics.group_total,
-        'params': {'value_col', 'group_col', 'filters'},
-        'description': 'Sum a numeric column by group (store, channel, year, ...).',
+    'revenue_by_year': {
+        'fn': analytics.revenue_by_year,
+        'params': {'channel', 'store'},
+        'description': 'Revenue for each year and the change from first to last year.',
+    },
+    'revenue_by_category': {
+        'fn': analytics.revenue_by_category,
+        'params': {'year', 'channel', 'store'},
+        'description': 'Revenue and share for each product category.',
+    },
+    'revenue_by_channel': {
+        'fn': analytics.revenue_by_channel,
+        'params': {'year', 'store'},
+        'description': 'Revenue and share for Website vs Brick & Mortar.',
+    },
+    'top_stores': {
+        'fn': analytics.top_stores,
+        'params': {'year', 'channel', 'n'},
+        'description': 'The n stores with the most revenue.',
     },
     'data_quality_report': {
         'fn': analytics.data_quality_report,
@@ -25,9 +47,24 @@ TOOLS = {
     },
 }
 
-UNSUPPORTED = ('I can only answer questions that my approved analytical functions can '
-               'calculate from the loaded data: ' + ', '.join(TOOLS) + '. '
-               'I cannot answer that one.')
+CAN_ANSWER = ('I can answer: total revenue; revenue by year, by category or by channel '
+              '(Website vs Brick & Mortar); the top stores by revenue; and data quality. '
+              'Each can be narrowed to a year, a channel or a store.')
+UNSUPPORTED = ('I cannot answer that one with my approved analytical functions '
+               f'({", ".join(TOOLS)}). ' + CAN_ANSWER)
+NO_RECOMMENDATION = 'No recommendation is supported by this data.'
+
+# Questions the data cannot support, with the reason given to the user.
+REJECTIONS = [
+    (r'\b(profit|margin|cost|costs|expense|net income|earnings)\b',
+     'The data has revenue only, with no costs, so profit and margins cannot be calculated.'),
+    (r'\b(why|cause|caused|causes|because|impact of|effect of|driv(e|es|en|ing))\b',
+     'The data shows what happened, not why. It cannot establish causes.'),
+    (r'\b(forecast|predict|projection|next year|future)\b',
+     'Forecasting is not one of my functions; I only report what is in the loaded data.'),
+    (r'\b(customer|customers|basket|transaction|transactions)\b',
+     'Sales are monthly totals per store and product, so there is no customer-level data.'),
+]
 
 # For when you add a language model: keep these rules in the system prompt.
 SYSTEM_PROMPT = """You are an analytical assistant for E-Presso managers.
@@ -40,6 +77,18 @@ Rules:
 - If the data cannot support a conclusion, say so and name the missing information.
 - Never ask for, run, or write code. Never modify data."""
 
+# The model's only job is to pick a function. The answer text is built by our own
+# code from the tool result, so the model never states a number itself.
+ROUTER_PROMPT = SYSTEM_PROMPT + """
+
+Your only job: choose exactly ONE of the provided functions, with arguments, that
+answers the manager's question about E-Presso revenue. Only fill in an argument when
+the question states it. Do not call a function if the question asks about profit,
+costs, causes ("why"), forecasts, customers, or anything else the functions cannot
+calculate; in that case reply with one short sentence saying it cannot be answered."""
+
+GEMINI_MODEL = 'gemini-3.5-flash'  # default; override with GEMINI_MODEL in Streamlit secrets
+
 
 def run_tool(name: str, args: dict, df, log: list) -> ToolResult:
     """The dispatcher: validate the request, run the function, log the call."""
@@ -51,43 +100,231 @@ def run_tool(name: str, args: dict, df, log: list) -> ToolResult:
             result = analytics._error(name, f'Unexpected argument(s): {sorted(unexpected)}')
         else:
             result = TOOLS[name]['fn'](df, **args)
-    log.append({'tool': name, 'arguments': args, 'result': result.to_dict()})
+    log.append({'tool': name, 'arguments': args, 'result': result.to_dict(),
+                'called_at': datetime.now(timezone.utc).isoformat(timespec='seconds')})
+    logger.info('tool call %s(%s) -> %s', name, args, 'error' if result.error else 'ok')
     return result
 
 
-def rules_router(question: str, df):
-    """Option B router. TODO: add rules for the tools YOU build.
-    Returns (tool_name, arguments) or None if the question is unsupported."""
+# ------------------------------------------------------------- rules router
+def rejection_reason(question: str):
+    """Why the data cannot answer this question, or None if it might."""
     q = question.lower()
-    if any(w in q for w in ('missing', 'duplicate', 'quality', 'blank')):
-        return 'data_quality_report', {}
+    for pattern, reason in REJECTIONS:
+        if re.search(pattern, q):
+            return reason
     return None
 
 
-def llm_router(question: str, df):
-    """Option A router. TODO: after the rules-based version works, ask a model that
-    supports function calling to choose from TOOLS. Return (name, args) or None."""
-    raise NotImplementedError('Add the language-model router after your tools are tested.')
+def extract_scope(question: str, df) -> dict:
+    """Pull year, channel and store out of the question. Values are passed on as
+    written; the tool itself checks them against the data and rejects unknown ones."""
+    q = question.lower()
+    args = {}
+    year = re.search(r'\b(19|20)\d{2}\b', q)
+    if year:
+        args['year'] = int(year.group())
+    if re.search(r'\b(website|online|web|e-?commerce)\b', q):
+        args['channel'] = 'Website'
+    elif re.search(r'\b(brick|mortar|physical|in-store|shops?)\b', q):
+        args['channel'] = 'Brick & Mortar'
+    store_id = re.search(r'\bsh\d{2}\b', q)
+    if store_id:
+        args['store'] = store_id.group().upper()
+    elif 'City' in df.columns:
+        cities = sorted(df['City'].dropna().unique(), key=len, reverse=True)
+        city = next((c for c in cities if re.search(rf'\b{re.escape(c.lower())}\b', q)), None)
+        if city:
+            args['store'] = city
+    return args
 
 
-def format_findings(result: ToolResult) -> str:
-    if result.error:
-        return f'The request could not be completed: {result.error}'
-    return f'{result.definition}: {result.value}  (rows used: {result.rows_used})'
+def rules_router(question: str, df):
+    """Option B router: keyword rules pick ONE tool from TOOLS and its arguments.
+    Returns (tool_name, arguments) or None if the question is unsupported."""
+    q = question.lower()
+    if re.search(r'\b(missing|duplicates?|quality|blanks?|nulls?)\b', q):
+        return 'data_quality_report', {}
+    scope = extract_scope(question, df)
+    if re.search(r'\b(categor(y|ies)|product line|products?|sells? best|best[- ]selling)\b', q):
+        name = 'revenue_by_category'
+    elif re.search(r'\b(top|best|highest|largest|biggest|most|rank|ranking)\b.*\b(stores?|locations?|shops?)\b'
+                   r'|\bwhich\b.*\b(stores?|locations?|shops?)\b', q):
+        name = 'top_stores'
+        words = {'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8,
+                 'nine': 9, 'ten': 10}
+        counts = [w for w in re.findall(r'\b(\d+|' + '|'.join(words) + r')\b', q)
+                  if not re.fullmatch(r'(19|20)\d{2}', w)]  # skip years
+        scope['n'] = int(words.get(counts[0], counts[0])) if counts else 5
+    elif re.search(r'\b(by channel|channels|channel split|split|vs|versus|compare|compared)\b', q):
+        name = 'revenue_by_channel'
+    elif re.search(r'\b(trend|grow|grew|grown|growth|growing|over time|by year|per year|each year'
+                   r'|yearly|annual|declin\w*)\b', q):
+        name = 'revenue_by_year'
+    elif re.search(r'\b(revenue|sales|total|sell|sold|turnover|money|made|make|brought in'
+                   r'|bring in)\b', q):
+        name = 'total_revenue'
+    else:
+        return None
+    allowed = TOOLS[name]['params']
+    return name, {k: v for k, v in scope.items() if k in allowed}
 
 
-def answer_question(question: str, df, mode: str = 'rules') -> dict:
+# --------------------------------------------------------- language-model router
+def tool_declarations(df) -> list:
+    """Function declarations for the fixed TOOLS, in JSON Schema. The allowed channel
+    values and the listed years come from the loaded data, not from hardcoded lists."""
+    channels = sorted(df['StoreType'].dropna().unique()) if 'StoreType' in df else []
+    years = sorted(int(y) for y in df['Year'].dropna().unique()) if 'Year' in df else []
+    props = {
+        'year': {'type': 'integer', 'description': f'Calendar year. Years in the data: {years}.'},
+        'channel': {'type': 'string', 'description': 'Sales channel (the store type).'},
+        'store': {'type': 'string', 'description': 'One store: its ID (e.g. SH01) or its city.'},
+        'n': {'type': 'integer', 'description': 'How many stores to list (default 5).'},
+    }
+    if channels:
+        props['channel']['enum'] = channels
+    return [{'name': name, 'description': spec['description'],
+             'parameters_json_schema': {
+                 'type': 'object',
+                 'properties': {p: props[p] for p in sorted(spec['params'])},
+                 'additionalProperties': False}}
+            for name, spec in TOOLS.items()]
+
+
+def _clean_args(args: dict) -> dict:
+    """JSON numbers can arrive as floats (2029.0); turn whole numbers back into ints."""
+    return {k: int(v) if isinstance(v, float) and v.is_integer() else v for k, v in args.items()}
+
+
+def llm_router(question: str, df, client, model: str = GEMINI_MODEL):
+    """Option A router: Gemini picks ONE tool from TOOLS through function calling.
+    Mode VALIDATED uses constrained decoding, so a call can only name one of our tools
+    with arguments that fit its schema. Gemini never sees the data and never writes the
+    answer. Returns (tool_name, arguments), or None if it declined. API errors are
+    raised so that answer_question can fall back to the rules router."""
+    from google.genai import types
+
+    config = types.GenerateContentConfig(
+        system_instruction=ROUTER_PROMPT,
+        tools=[types.Tool(function_declarations=[
+            types.FunctionDeclaration(**d) for d in tool_declarations(df)])],
+        tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(
+            mode='VALIDATED', allowed_function_names=list(TOOLS))),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        temperature=0,
+    )
+    response = client.models.generate_content(model=model, contents=question, config=config)
+    calls = response.function_calls or []
+    if not calls:
+        return None
+    return calls[0].name, _clean_args(dict(calls[0].args or {}))
+
+
+# ---------------------------------------------------------------- answers
+def _money(x) -> str:
+    return f'${x:,.2f}'
+
+
+def _pct(x) -> str:
+    return 'n/a' if x is None else f'{x:.1%}'
+
+
+def describe_scope(scope: dict) -> str:
+    if not scope:
+        return 'Scope: not applicable'
+    year = scope.get('year', 'all years')
+    year = f'year {year}' if isinstance(year, int) else year
+    return f"Scope: {scope.get('store', 'all stores')}, {year}, {scope.get('channel', 'all channels')}"
+
+
+def findings_and_interpretation(result: ToolResult):
+    """Turn a tool result into Findings (only numbers from the result) and a
+    one-sentence Interpretation computed from those same numbers."""
+    v = result.value
+    if result.tool == 'total_revenue':
+        return (f"Revenue: {_money(v['revenue'])} from {result.rows_used:,} sales rows.",
+                f"That is {_pct(v['share_of_all_revenue'])} of all revenue in the loaded data.")
+    if result.tool == 'revenue_by_year':
+        years = '; '.join(f'{y}: {_money(x)}' for y, x in v['by_year'].items())
+        change = v['change_first_to_last_pct']
+        first, last = list(v['by_year'])[0], list(v['by_year'])[-1]
+        if change is None:
+            return years, 'Only one year is in scope, so there is no change to describe.'
+        word = 'rose' if change >= 0 else 'fell'
+        return years, f'Revenue {word} {abs(change):.1f}% from {first} to {last}.'
+    if result.tool in ('revenue_by_category', 'revenue_by_channel'):
+        key = 'by_category' if result.tool == 'revenue_by_category' else 'by_channel'
+        parts = v[key]
+        lines = '; '.join(f"{k}: {_money(x['revenue'])} ({_pct(x['share'])})" for k, x in parts.items())
+        top, top_v = next(iter(parts.items()))
+        noun = 'category' if key == 'by_category' else 'channel'
+        return lines, f"The largest {noun} is {top}, with {_pct(top_v['share'])} of revenue in this scope."
+    if result.tool == 'top_stores':
+        lines = '; '.join(f"{s['rank']}. {s['store']}: {_money(s['revenue'])} ({_pct(s['share'])})"
+                          for s in v['stores'])
+        best = v['stores'][0]
+        return lines, (f"The top store, {best['store']}, accounts for {_pct(best['share'])} of "
+                       f"revenue across the {v['stores_in_scope']} stores in scope.")
+    if result.tool == 'data_quality_report':
+        missing = v['columns_with_missing']
+        cols = ', '.join(f'{c} ({n})' for c, n in missing.items()) or 'none'
+        return (f"{v['rows']:,} rows; {v['duplicate_rows']} duplicate rows; columns with missing "
+                f'values: {cols}.',
+                'Blank values are reported, not filled in, so totals only use recorded values.')
+    return f'{result.definition}: {result.value}', ''
+
+
+NEXT_STEPS = {
+    'total_revenue': 'Break this total down by category, channel or year for the same scope.',
+    'revenue_by_year': 'Compare channels for the first and last year to see where the change came from.',
+    'revenue_by_category': 'Check whether the category mix differs between the Website and Brick & Mortar.',
+    'revenue_by_channel': 'Look at revenue by year for each channel to see how the split has moved.',
+    'top_stores': 'Ask for one of these stores by ID to see its categories or yearly trend.',
+}
+
+
+def answer_question(question: str, df, mode: str = 'rules', llm_client=None,
+                    model: str = GEMINI_MODEL) -> dict:
+    """Route the question to one tool, run it through the dispatcher, and build the
+    answer from the tool result. mode='llm' uses Gemini when a client is given; if the
+    call fails for any reason (no network, quota, bad key), the rules router answers."""
     log: list = []
-    routed = rules_router(question, df) if mode == 'rules' else llm_router(question, df)
+    answered_by, note = 'Rules-based assistant', ''
+    reason = rejection_reason(question)
+    if reason:
+        routed = None
+    elif mode == 'llm' and llm_client is not None:
+        try:
+            routed = llm_router(question, df, llm_client, model)
+            answered_by = f'Gemini ({model}) choosing an approved tool'
+            log.append({'router': 'gemini', 'model': model,
+                        'choice': {'tool': routed[0], 'arguments': routed[1]} if routed else None})
+        except Exception as exc:  # any LLM failure falls back to the rules router
+            logger.warning('Gemini router failed: %s', exc)
+            note = (f'Gemini was unavailable ({type(exc).__name__}), so the rules-based '
+                    'assistant answered instead.')
+            routed = rules_router(question, df)
+    else:
+        routed = rules_router(question, df)
+    base = {'answered_by': answered_by, 'note': note, 'tool_log': log}
+
     if routed is None:
-        return {'scope': 'n/a', 'findings': UNSUPPORTED, 'interpretation': '',
-                'next_steps': '', 'tool_log': log}
+        findings = (f'I cannot answer that one. {reason} {CAN_ANSWER}' if reason else UNSUPPORTED)
+        return {**base, 'scope': describe_scope({}), 'findings': findings, 'interpretation': '',
+                'caveats': [], 'next_steps': NO_RECOMMENDATION}
     name, args = routed
     result = run_tool(name, args, df, log)
+    if result.error:
+        return {**base, 'scope': describe_scope(result.scope),
+                'findings': f'The request could not be completed: {result.error}',
+                'interpretation': '', 'caveats': [], 'next_steps': NO_RECOMMENDATION}
+    findings, interpretation = findings_and_interpretation(result)
     return {
-        'scope': str(result.scope),
-        'findings': format_findings(result),
-        'interpretation': ' '.join(result.caveats),
-        'next_steps': '',
-        'tool_log': log,
+        **base,
+        'scope': describe_scope(result.scope),
+        'findings': findings,
+        'interpretation': interpretation,
+        'caveats': result.caveats,
+        'next_steps': NEXT_STEPS.get(name, NO_RECOMMENDATION),
     }
