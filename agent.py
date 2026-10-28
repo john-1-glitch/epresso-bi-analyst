@@ -25,7 +25,14 @@ TOOLS = {
     'revenue_by_year': {
         'fn': analytics.revenue_by_year,
         'params': {'channel', 'store'},
-        'description': 'Revenue for each year and the change from first to last year.',
+        'description': ('Revenue for each year, the best and worst year, and the change from '
+                        'first to last year.'),
+    },
+    'monthly_revenue_share': {
+        'fn': analytics.monthly_revenue_share,
+        'params': {'year', 'channel', 'store'},
+        'description': ('Revenue and share for each calendar month, with the strongest and '
+                        'weakest month (seasonality).'),
     },
     'revenue_by_category': {
         'fn': analytics.revenue_by_category,
@@ -68,7 +75,8 @@ TOOLS = {
     },
 }
 
-CAN_ANSWER = ('I can answer: total revenue; revenue by year, by category or by channel '
+CAN_ANSWER = ('I can answer: total revenue; revenue by year (including the best and worst '
+              'year), by month, by category or by channel '
               '(Website vs Brick & Mortar); the top stores; how each store or channel changed '
               'between two years; how satisfaction scores relate to revenue; and data quality. '
               'Most can be narrowed to a year, a channel or a store.')
@@ -232,6 +240,11 @@ def rules_router(question: str, df):
     scope = extract_scope(question, df)
     if re.search(r'\b(satisf\w*|survey|happy|happier)\b', q):
         name = 'satisfaction_vs_revenue'
+    elif re.search(r'\b(months?|monthly|season\w*|christmas|holiday)\b', q):
+        name = 'monthly_revenue_share'
+    elif re.search(r'\b(which|what)\b.*\byears?\b|\b(best|worst|highest|lowest|strongest'
+                   r'|weakest|biggest|top|record)\b.*\byears?\b', q):
+        name = 'revenue_by_year'
     elif re.search(CHANGE, q) and re.search(RANKED, q) and re.search(CHANNEL_WORDS, q):
         name = 'revenue_change_by_channel'
     elif re.search(CHANGE, q) and re.search(RANKED, q) and re.search(PLACES, q) and 'store' not in scope:
@@ -253,6 +266,9 @@ def rules_router(question: str, df):
     elif re.search(r'\b(revenue|sales|total|sell|sold|turnover|money|made|make|brought in'
                    r'|bring in)\b', q):
         name = 'total_revenue'
+    elif re.search(r'\b(do|did|does|perform\w*|go|went|look)\b', q) and (
+            'year' in scope or 'store' in scope or 'channel' in scope):
+        name = 'total_revenue'  # "How did 2027 do?"
     elif question_flags(question)['decision'] and 'store' in scope:
         name = 'revenue_by_year'  # "should we close Chicago?" -> show Chicago's trend
     else:
@@ -419,7 +435,17 @@ def findings_and_interpretation(result: ToolResult):
         if change is None:
             return years, 'Only one year is in scope, so there is no change to describe.'
         word = 'rose' if change >= 0 else 'fell'
-        return years, f'Revenue {word} {abs(change):.1f}% from {first} to {last}.'
+        best, worst = v['best_year'], v['worst_year']
+        return (f"{years}. Best year: {best['year']} ({_money(best['revenue'])}); weakest: "
+                f"{worst['year']} ({_money(worst['revenue'])}).",
+                f'Revenue {word} {abs(change):.1f}% from {first} to {last}.')
+    if result.tool == 'monthly_revenue_share':
+        lines = '; '.join(f"{k}: {_money(x['revenue'])} ({_pct(x['share'])})"
+                          for k, x in v['by_month'].items())
+        best, worst = v['best_month'], v['worst_month']
+        share = v['by_month'][best['month']]['share']
+        return (lines, f"{best['month']} is the strongest month with {_pct(share)} of revenue in "
+                       f"this scope; {worst['month']} is the weakest.")
     if result.tool in ('revenue_by_category', 'revenue_by_channel'):
         key = 'by_category' if result.tool == 'revenue_by_category' else 'by_channel'
         parts = v[key]
@@ -476,6 +502,7 @@ def findings_and_interpretation(result: ToolResult):
 NEXT_STEPS = {
     'total_revenue': 'Break this total down by category, channel or year for the same scope.',
     'revenue_by_year': 'Compare channels for the first and last year to see where the change came from.',
+    'monthly_revenue_share': 'Compare the monthly pattern for the Website and Brick & Mortar.',
     'revenue_by_category': 'Check whether the category mix differs between the Website and Brick & Mortar.',
     'revenue_by_channel': 'Look at revenue by year for each channel to see how the split has moved.',
     'top_stores': 'Ask for one of these stores by ID to see its categories or yearly trend.',

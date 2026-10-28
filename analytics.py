@@ -531,11 +531,36 @@ def revenue_by_year(model: pd.DataFrame, channel=None, store=None) -> ToolResult
         tool=name,
         value={'by_year': {str(int(y)): round(float(v), 2) for y, v in by_year.items()},
                'change_first_to_last_pct': round(float((last - first) / first * 100), 2)
-               if first and len(by_year) > 1 else None},
+               if first and len(by_year) > 1 else None,
+               'best_year': {'year': int(by_year.idxmax()), 'revenue': round(float(by_year.max()), 2)},
+               'worst_year': {'year': int(by_year.idxmin()), 'revenue': round(float(by_year.min()), 2)}},
         definition=('Sum of Revenue for each calendar year of the sale date. Change = '
                     '(last year - first year) / first year x 100.'),
         scope=scope, rows_used=int(subset['Revenue'].notna().sum()),
         caveats=_caveats(subset, 'A change over time shows what happened, not why it happened.'))
+
+
+def monthly_revenue_share(model: pd.DataFrame, year=None, channel=None, store=None) -> ToolResult:
+    """Revenue for each calendar month and its share of the scope's revenue, with the
+    strongest and weakest month. Without a year, months are summed over all years."""
+    name = 'monthly_revenue_share'
+    subset, scope, err = _resolve_scope(model, year, channel, store)
+    if err:
+        return _error(name, err, scope)
+    by_month = (subset.dropna(subset=['Date']).groupby(subset['Date'].dt.month)['Revenue'].sum()
+                .reindex(range(1, 13), fill_value=0.0))
+    by_month.index = MONTH_NAMES
+    caveats = _caveats(subset)
+    if year is None:
+        caveats.append('Each month is summed over every year in scope.')
+    return ToolResult(
+        tool=name,
+        value={'by_month': _shares(by_month),
+               'best_month': {'month': by_month.idxmax(), 'revenue': round(float(by_month.max()), 2)},
+               'worst_month': {'month': by_month.idxmin(), 'revenue': round(float(by_month.min()), 2)}},
+        definition=('Sum of Revenue for each calendar month of the sale date; share = month '
+                    'revenue / revenue in scope (all months in scope add up to 100%).'),
+        scope=scope, rows_used=int(subset['Revenue'].notna().sum()), caveats=caveats)
 
 
 def revenue_by_category(model: pd.DataFrame, year=None, channel=None, store=None) -> ToolResult:
