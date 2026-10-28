@@ -181,7 +181,7 @@ def test_revenue_by_year_and_channel(model):
 
 
 def test_revenue_by_category_largest_first_with_shares(model):
-    table = analytics.revenue_by_category(model)
+    table = analytics.category_breakdown(model)
     assert list(table['Category']) == ['Machines', 'Beans']
     assert list(table['Revenue']) == [700, 300]
     assert list(table['Share']) == pytest.approx([0.7, 0.3])
@@ -198,5 +198,5 @@ def test_revenue_by_month_lists_all_twelve_months(model):
 def test_empty_selection_does_not_crash(model):
     empty = analytics.filter_sales(model, stores=['W'], channels=['Brick & Mortar'])
     assert empty.empty
-    assert analytics.revenue_by_category(empty).empty
+    assert analytics.category_breakdown(empty).empty
     assert analytics.revenue_by_month(empty)['Revenue'].sum() == 0

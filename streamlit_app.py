@@ -146,7 +146,7 @@ def render_dashboard():
 
     # Chart 2: which product categories bring in the money?
     with left:
-        by_cat = analytics.revenue_by_category(view).iloc[::-1]  # largest at the top
+        by_cat = analytics.category_breakdown(view).iloc[::-1]  # largest at the top
         fig = go.Figure(go.Bar(
             x=by_cat['Revenue'], y=by_cat['Category'], orientation='h',
             marker_color=BAR_COLOR, customdata=by_cat['Share'],
@@ -241,19 +241,31 @@ with tab_dash:
     render_dashboard()
 
 with tab_assistant:
-    st.caption('Mode: rules-based starter. Describe what you actually built here.')
+    st.caption('Mode: rules-based assistant. Keyword rules choose one approved analytical '
+               'function; the numbers come only from that function. No language model is used.')
+    with st.expander('What can I ask?'):
+        st.markdown(agent.CAN_ANSWER + '\n\nExamples: "What was total revenue in 2029?", '
+                    '"Website revenue by year", "Revenue by category for SH09", '
+                    '"Top 3 stores in 2027", "Website vs brick and mortar in 2025".')
     st.session_state.setdefault('n_questions', 0)
     st.session_state.setdefault('history', [])
+    st.caption(f"Questions used: {st.session_state['n_questions']} of {MAX_QUESTIONS}")
     for item in st.session_state['history']:
+        answer = item['answer']
         with st.chat_message('user'):
             st.write(item['question'])
         with st.chat_message('assistant'):
-            st.markdown(f"**Scope:** {item['answer']['scope']}")
-            st.markdown(f"**Findings:** {item['answer']['findings']}")
-            if item['answer']['interpretation']:
-                st.markdown(f"**Interpretation:** {item['answer']['interpretation']}")
+            st.markdown(f"**{answer['scope']}**")
+            st.markdown(f"**Findings**  \n{answer['findings']}")
+            if answer['interpretation'] or answer['caveats']:
+                st.markdown('**Interpretation**  \n' + answer['interpretation'] + ''.join(
+                    f'\n- {c}' for c in answer['caveats']))
+            st.markdown(f"**Next steps**  \n{answer['next_steps']}")
             with st.expander('Tool-call log'):
-                st.json(item['answer']['tool_log'])
+                if answer['tool_log']:
+                    st.json(answer['tool_log'])
+                else:
+                    st.write('No tool was called.')
     question = st.chat_input('Ask a question about the loaded data')
     if question:
         if st.session_state['n_questions'] >= MAX_QUESTIONS:

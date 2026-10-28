@@ -154,7 +154,11 @@ class ToolResult:
     error: str | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        """The tool contract. `error` only appears when the call failed."""
+        out = asdict(self)
+        if out['error'] is None:
+            out.pop('error')
+        return out
 
 
 def _error(tool: str, message: str, scope: dict | None = None) -> ToolResult:
@@ -232,7 +236,8 @@ def data_quality_report(df: pd.DataFrame) -> ToolResult:
                       value={'rows': len(df), 'duplicate_rows': int(df.duplicated().sum()),
                              'columns_with_missing': missing},
                       definition='Counts of duplicate rows and missing values in the loaded table',
-                      scope={'filters': 'none (full table)'}, rows_used=len(df), caveats=caveats)
+                      scope={'year': 'all years', 'store': 'all stores', 'channel': 'all channels'},
+                      rows_used=len(df), caveats=caveats)
 
 
 # ------------------------------------------------------------ merge check
@@ -364,8 +369,8 @@ def revenue_by_year_channel(df: pd.DataFrame) -> pd.DataFrame:
               .sort_values(['Year', 'StoreType']))
 
 
-def revenue_by_category(df: pd.DataFrame) -> pd.DataFrame:
-    """Revenue and share of the filtered total for each category, largest first."""
+def category_breakdown(df: pd.DataFrame) -> pd.DataFrame:
+    """Revenue and share of the filtered total for each category, largest first (dashboard)."""
     out = df.groupby('Category', as_index=False)['Revenue'].sum()
     total = out['Revenue'].sum()
     out['Share'] = out['Revenue'] / total if total else 0.0
@@ -384,6 +389,164 @@ def revenue_by_month(df: pd.DataFrame) -> pd.DataFrame:
         'Revenue': by_month.values,
         'Share': by_month.values / total if total else 0.0,
     })
+
+
+# --------------------------------------------------------- assistant tools
+# Each tool takes explicit year / channel / store arguments (never Streamlit state),
+# checks them against the loaded data, and returns a ToolResult. None of them change
+# the data they are given.
+NOT_PROFIT = 'Revenue is not profit: the data has no costs or margins.'
+
+
+def _resolve_scope(model: pd.DataFrame, year=None, channel=None, store=None):
+    """Validate year, channel and store against the LOADED data and apply them.
+    Unknown or ambiguous values return an error naming the valid choices; nothing
+    is guessed. Returns (subset, scope, error)."""
+    scope = {'year': 'all years', 'store': 'all stores', 'channel': 'all channels'}
+    mask = pd.Series(True, index=model.index)
+    if year is not None:
+        years = sorted(int(y) for y in model['Year'].dropna().unique())
+        try:
+            year = int(str(year).strip())
+        except ValueError:
+            return None, scope, f'"{year}" is not a year. Available years: {years}.'
+        if year not in years:
+            return None, scope, f'There are no sales for {year}. Available years: {years}.'
+        mask &= model['Year'] == year
+        scope['year'] = year
+    if channel is not None:
+        channels = sorted(model['StoreType'].dropna().unique())
+        match = [c for c in channels if c.lower() == str(channel).strip().lower()]
+        if not match:
+            return None, scope, f'Unknown channel "{channel}". Valid channels: {channels}.'
+        mask &= model['StoreType'] == match[0]
+        scope['channel'] = match[0]
+    if store is not None:
+        stores = model.drop_duplicates('Store ID')
+        wanted = str(store).strip().lower()
+        hits = stores[(stores['Store ID'].str.lower() == wanted)
+                      | (stores['City'].fillna('').str.lower() == wanted)]
+        labels = [store_label(s, c, loc) for s, c, loc in
+                  zip(hits['Store ID'], hits['City'], hits['Location'])]
+        if hits.empty:
+            return None, scope, (f'Unknown store "{store}". Use a store ID or a city, e.g. '
+                                 f'{sorted(stores["Store ID"])[:5]}.')
+        if len(hits) > 1:
+            return None, scope, (f'"{store}" matches {len(hits)} stores: {", ".join(labels)}. '
+                                 'Ask again using the store ID.')
+        mask &= model['Store ID'] == hits['Store ID'].iloc[0]
+        scope['store'] = labels[0]
+    subset = model[mask]
+    if subset.empty:
+        return None, scope, 'No sales match this combination of year, channel and store.'
+    return subset, scope, None
+
+
+def _caveats(subset: pd.DataFrame, *extra: str) -> list:
+    caveats = [NOT_PROFIT, *extra]
+    n_blank = int(subset['Revenue'].isna().sum())
+    if n_blank:
+        caveats.append(f'{n_blank} sales row(s) with blank revenue were left out.')
+    return caveats
+
+
+def _shares(revenue: pd.Series) -> dict:
+    """{name: {'revenue': x, 'share': x / total}} in the series' order."""
+    total = revenue.sum()
+    return {str(k): {'revenue': round(float(v), 2),
+                     'share': round(float(v / total), 4) if total else None}
+            for k, v in revenue.items()}
+
+
+def total_revenue(model: pd.DataFrame, year=None, channel=None, store=None) -> ToolResult:
+    """Total revenue in scope, and its share of all loaded revenue."""
+    name = 'total_revenue'
+    subset, scope, err = _resolve_scope(model, year, channel, store)
+    if err:
+        return _error(name, err, scope)
+    revenue = float(subset['Revenue'].sum())
+    everything = float(model['Revenue'].sum())
+    return ToolResult(
+        tool=name,
+        value={'revenue': round(revenue, 2),
+               'share_of_all_revenue': round(revenue / everything, 4) if everything else None},
+        definition=('Sum of Revenue over the sales rows in scope. Share = that sum divided '
+                    'by the revenue of all loaded sales.'),
+        scope=scope, rows_used=int(subset['Revenue'].notna().sum()), caveats=_caveats(subset))
+
+
+def revenue_by_year(model: pd.DataFrame, channel=None, store=None) -> ToolResult:
+    """Revenue for each year, and the % change from the first to the last year."""
+    name = 'revenue_by_year'
+    subset, scope, err = _resolve_scope(model, None, channel, store)
+    if err:
+        return _error(name, err, scope)
+    by_year = subset.dropna(subset=['Year']).groupby('Year')['Revenue'].sum().sort_index()
+    first, last = by_year.iloc[0], by_year.iloc[-1]
+    return ToolResult(
+        tool=name,
+        value={'by_year': {str(int(y)): round(float(v), 2) for y, v in by_year.items()},
+               'change_first_to_last_pct': round(float((last - first) / first * 100), 2)
+               if first and len(by_year) > 1 else None},
+        definition=('Sum of Revenue for each calendar year of the sale date. Change = '
+                    '(last year - first year) / first year x 100.'),
+        scope=scope, rows_used=int(subset['Revenue'].notna().sum()),
+        caveats=_caveats(subset, 'A change over time shows what happened, not why it happened.'))
+
+
+def revenue_by_category(model: pd.DataFrame, year=None, channel=None, store=None) -> ToolResult:
+    """Revenue and share of the scope's revenue for each product category, largest first."""
+    name = 'revenue_by_category'
+    subset, scope, err = _resolve_scope(model, year, channel, store)
+    if err:
+        return _error(name, err, scope)
+    by_cat = subset.groupby('Category')['Revenue'].sum().sort_values(ascending=False)
+    return ToolResult(
+        tool=name, value={'by_category': _shares(by_cat)},
+        definition='Sum of Revenue for each product category; share = category revenue / revenue in scope.',
+        scope=scope, rows_used=int(subset['Revenue'].notna().sum()), caveats=_caveats(subset))
+
+
+def revenue_by_channel(model: pd.DataFrame, year=None, store=None) -> ToolResult:
+    """Revenue and share for each channel (Website vs Brick & Mortar)."""
+    name = 'revenue_by_channel'
+    subset, scope, err = _resolve_scope(model, year, None, store)
+    if err:
+        return _error(name, err, scope)
+    by_channel = subset.groupby('StoreType')['Revenue'].sum().sort_values(ascending=False)
+    return ToolResult(
+        tool=name, value={'by_channel': _shares(by_channel)},
+        definition='Sum of Revenue for each channel; share = channel revenue / revenue in scope.',
+        scope=scope, rows_used=int(subset['Revenue'].notna().sum()),
+        caveats=_caveats(subset, "Channel is the store's StoreType in the Stores table "
+                                 '(the website is one "store").'))
+
+
+def top_stores(model: pd.DataFrame, year=None, channel=None, n=5) -> ToolResult:
+    """The n stores with the most revenue in scope, with each one's share."""
+    name = 'top_stores'
+    subset, scope, err = _resolve_scope(model, year, channel, None)
+    if err:
+        return _error(name, err, scope)
+    n_stores = subset['Store ID'].nunique()
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return _error(name, f'"{n}" is not a number of stores.', scope)
+    if not 1 <= n <= n_stores:
+        return _error(name, f'n must be between 1 and {n_stores}.', scope)
+    labels = {s: store_label(s, c, loc) for s, c, loc in
+              zip(subset['Store ID'], subset['City'], subset['Location'])}
+    by_store = subset.groupby('Store ID')['Revenue'].sum().sort_values(ascending=False)
+    total = by_store.sum()
+    ranking = [{'rank': i + 1, 'store': labels[s], 'revenue': round(float(v), 2),
+                'share': round(float(v / total), 4) if total else None}
+               for i, (s, v) in enumerate(by_store.head(n).items())]
+    return ToolResult(
+        tool=name, value={'stores': ranking, 'stores_in_scope': int(n_stores)},
+        definition=('Sum of Revenue for each store, ranked highest first; share = store '
+                    'revenue / revenue of all stores in scope.'),
+        scope=scope, rows_used=int(subset['Revenue'].notna().sum()), caveats=_caveats(subset))
 
 
 def grain_table(tables: dict, sources: dict) -> pd.DataFrame:
