@@ -26,6 +26,21 @@ def cached_dataset(uploads: tuple):
     return analytics.build_dataset(uploads)
 
 
+def secret(name: str, default=None):
+    """Read a Streamlit secret; returns the default when there is no secrets file."""
+    try:
+        return st.secrets.get(name, default)
+    except Exception:  # no .streamlit/secrets.toml (local run without a key)
+        return default
+
+
+@st.cache_resource(show_spinner=False)
+def gemini_client(api_key: str):
+    from google import genai
+    from google.genai import types
+    return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=20_000))
+
+
 def money(x: float) -> str:
     return f'${x:,.2f}'
 
@@ -241,8 +256,18 @@ with tab_dash:
     render_dashboard()
 
 with tab_assistant:
-    st.caption('Mode: rules-based assistant. Keyword rules choose one approved analytical '
-               'function; the numbers come only from that function. No language model is used.')
+    api_key = secret('GEMINI_API_KEY')
+    gemini_model = secret('GEMINI_MODEL', agent.GEMINI_MODEL)
+    use_llm = bool(api_key) and st.toggle('Use Gemini to choose the tool', value=True)
+    if use_llm:
+        st.caption(f'Mode: Gemini ({gemini_model}) chooses ONE approved analytical function through '
+                   'function calling. The answer is written by our code from that function\'s '
+                   'result, so every number comes from the data. If Gemini fails, the '
+                   'rules-based assistant answers instead.')
+    else:
+        st.caption('Mode: rules-based assistant. Keyword rules choose one approved analytical '
+                   'function; the numbers come only from that function.'
+                   + ('' if api_key else ' (No GEMINI_API_KEY in the app secrets.)'))
     with st.expander('What can I ask?'):
         st.markdown(agent.CAN_ANSWER + '\n\nExamples: "What was total revenue in 2029?", '
                     '"Website revenue by year", "Revenue by category for SH09", '
@@ -261,6 +286,9 @@ with tab_assistant:
                 st.markdown('**Interpretation**  \n' + answer['interpretation'] + ''.join(
                     f'\n- {c}' for c in answer['caveats']))
             st.markdown(f"**Next steps**  \n{answer['next_steps']}")
+            if answer['note']:
+                st.warning(answer['note'])
+            st.caption(f"Answered by: {answer['answered_by']}")
             with st.expander('Tool-call log'):
                 if answer['tool_log']:
                     st.json(answer['tool_log'])
@@ -272,6 +300,14 @@ with tab_assistant:
             st.warning('Question limit reached for this session. Reload the page to start over.')
         else:
             st.session_state['n_questions'] += 1
-            answer = agent.answer_question(question, model, mode='rules')
+            if use_llm:
+                try:
+                    client = gemini_client(api_key)
+                except Exception:  # SDK missing or bad key format: answer_question falls back
+                    client = None
+                answer = agent.answer_question(question, model, mode='llm', llm_client=client,
+                                               model=gemini_model)
+            else:
+                answer = agent.answer_question(question, model, mode='rules')
             st.session_state['history'].append({'question': question, 'answer': answer})
             st.rerun()

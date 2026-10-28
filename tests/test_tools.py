@@ -123,6 +123,10 @@ def test_dispatcher_runs_and_logs_every_call(model):
     ('How has website revenue grown?', ('revenue_by_year', {'channel': 'Website'})),
     ('Website vs brick and mortar', ('revenue_by_channel', {})),
     ('Any missing values?', ('data_quality_report', {})),
+    ('Are there blanks in the data?', ('data_quality_report', {})),
+    ('How much money did we make in 2026?', ('total_revenue', {'year': 2026})),
+    ('In 2026, which three locations brought in the most?', ('top_stores', {'year': 2026, 'n': 3})),
+    ('What sells best in Denver?', ('revenue_by_category', {'store': 'Denver'})),
 ])
 def test_rules_router(model, question, expected):
     assert agent.rules_router(question, model) == expected
