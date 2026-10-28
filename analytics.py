@@ -320,6 +320,72 @@ def revenue_summary(sales: pd.DataFrame) -> dict:
     }
 
 
+# --------------------------------------------------------------- dashboard
+MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+
+def store_label(store_id: str, city, location) -> str:
+    """Readable store name for filters and charts, e.g. 'SH01 · Orlando (South)'."""
+    if pd.isna(city) or not str(city).strip():
+        return f'{store_id} · {location}'  # the website has no city
+    return f'{store_id} · {city} ({location})'
+
+
+def filter_options(model: pd.DataFrame) -> dict:
+    """Every filter list comes from the loaded data, never from hardcoded values.
+    Stores are returned as {store_id: label} so the filter can show names."""
+    stores = model.drop_duplicates('Store ID').sort_values('Store ID')
+    return {
+        'years': sorted(int(y) for y in model['Year'].dropna().unique()),
+        'channels': sorted(model['StoreType'].dropna().unique()),
+        'stores': {s: store_label(s, c, loc) for s, c, loc in
+                   zip(stores['Store ID'], stores['City'], stores['Location'])},
+        'categories': sorted(model['Category'].dropna().unique()),
+    }
+
+
+def filter_sales(model: pd.DataFrame, years=None, channels=None, stores=None,
+                 categories=None) -> pd.DataFrame:
+    """Rows matching every filter. An empty or None filter means 'all'.
+    Returns a filtered view; the loaded data is never changed."""
+    mask = pd.Series(True, index=model.index)
+    for col, wanted in (('Year', years), ('StoreType', channels),
+                        ('Store ID', stores), ('Category', categories)):
+        if wanted:
+            mask &= model[col].isin(list(wanted))
+    return model[mask]
+
+
+def revenue_by_year_channel(df: pd.DataFrame) -> pd.DataFrame:
+    """Revenue for each year and channel (StoreType): one row per year-channel pair."""
+    return (df.dropna(subset=['Year', 'Revenue'])
+              .groupby(['Year', 'StoreType'], as_index=False)['Revenue'].sum()
+              .sort_values(['Year', 'StoreType']))
+
+
+def revenue_by_category(df: pd.DataFrame) -> pd.DataFrame:
+    """Revenue and share of the filtered total for each category, largest first."""
+    out = df.groupby('Category', as_index=False)['Revenue'].sum()
+    total = out['Revenue'].sum()
+    out['Share'] = out['Revenue'] / total if total else 0.0
+    return out.sort_values('Revenue', ascending=False).reset_index(drop=True)
+
+
+def revenue_by_month(df: pd.DataFrame) -> pd.DataFrame:
+    """Revenue for each calendar month, summed over the selected years, with its share
+    of the filtered total. Shows seasonality. All 12 months are listed, even if zero."""
+    by_month = (df.dropna(subset=['Date', 'Revenue'])
+                  .groupby(df['Date'].dt.month)['Revenue'].sum()
+                  .reindex(range(1, 13), fill_value=0.0))
+    total = by_month.sum()
+    return pd.DataFrame({
+        'Month': MONTH_NAMES,
+        'Revenue': by_month.values,
+        'Share': by_month.values / total if total else 0.0,
+    })
+
+
 def grain_table(tables: dict, sources: dict) -> pd.DataFrame:
     """The grain statement for every loaded table, built from the data itself."""
     rows = []

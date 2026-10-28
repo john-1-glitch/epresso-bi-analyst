@@ -3,6 +3,7 @@ total revenue. Keep calculations in analytics.py and the assistant in agent.py."
 import logging
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 import agent
@@ -27,6 +28,37 @@ def cached_dataset(uploads: tuple):
 
 def money(x: float) -> str:
     return f'${x:,.2f}'
+
+
+# Categorical colors in a fixed order (colorblind-checked pair). Each channel keeps
+# its color whatever the filters, because color follows the entity, not its rank.
+SERIES_COLORS = ['#2a78d6', '#eb6834']
+BAR_COLOR = SERIES_COLORS[0]
+
+
+def style_chart(fig: go.Figure, title: str, height: int = 360) -> go.Figure:
+    fig.update_layout(
+        title=dict(text=title, x=0, font=dict(size=16)), height=height,
+        margin=dict(l=8, r=8, t=56, b=8), hovermode='closest',
+        legend=dict(orientation='h', yanchor='bottom', y=1.0, xanchor='left', x=0),
+        barcornerradius=4, bargap=0.35,
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor='rgba(128,128,128,0.2)', zeroline=False)
+    return fig
+
+
+def table_view(df: pd.DataFrame, money_cols=('Revenue',), pct_cols=('Share',)):
+    """Same numbers as the chart, as a table (for screen readers and exact values)."""
+    out = df.copy()
+    for col in money_cols:
+        if col in out:
+            out[col] = out[col].map(money)
+    for col in pct_cols:
+        if col in out:
+            out[col] = out[col].map('{:.1%}'.format)
+    with st.expander('View as table'):
+        st.dataframe(out, hide_index=True)
 
 
 with st.sidebar:
@@ -55,6 +87,89 @@ if data['errors']:
 
 tables, model, reports = data['tables'], data['model'], data['merge_reports']
 merges_ok = not any(r['changed'] for r in reports)
+
+
+def render_dashboard():
+    """Filters, KPIs and three charts. A function so that an early `return`
+    (bad joins, empty selection) leaves the other tabs running."""
+    if not merges_ok:
+        st.error('A join changed the revenue total (see "Revenue and merge checks"). '
+                 'The dashboard is hidden until the data is fixed.')
+        return
+
+    options = analytics.filter_options(model)
+    channel_color = dict(zip(options['channels'], SERIES_COLORS * 4))
+
+    # Filters: one row above the charts. Empty means "all".
+    f1, f2, f3, f4 = st.columns(4)
+    years = f1.multiselect('Year', options['years'], placeholder='All years')
+    channels = f2.multiselect('Channel', options['channels'], placeholder='All channels')
+    stores = f3.multiselect('Store', list(options['stores']), placeholder='All stores',
+                            format_func=options['stores'].get)
+    categories = f4.multiselect('Category', options['categories'], placeholder='All categories')
+
+    view = analytics.filter_sales(model, years, channels, stores, categories)
+    scope = ' · '.join([
+        ', '.join(map(str, years)) if years else 'All years',
+        ', '.join(channels) if channels else 'all channels',
+        f'{len(stores)} store(s)' if stores else 'all stores',
+        ', '.join(categories) if categories else 'all categories',
+    ])
+    st.caption(f'Scope: {scope}')
+
+    if view.empty:
+        st.info('No sales match these filters. Remove a filter to see results.')
+        return
+
+    all_revenue = float(model['Revenue'].sum())
+    view_revenue = float(view['Revenue'].sum())
+    k1, k2, k3 = st.columns(3)
+    k1.metric('Revenue in selection', money(view_revenue))
+    k2.metric('Share of all revenue', f'{view_revenue / all_revenue:.1%}' if all_revenue else 'n/a')
+    k3.metric('Stores in selection', view['Store ID'].nunique())
+    st.caption('Revenue is not profit: the data has no costs, so margins cannot be shown.')
+
+    # Chart 1: is revenue growing, and in which channel?
+    by_year = analytics.revenue_by_year_channel(view)
+    fig = go.Figure()
+    for channel, part in by_year.groupby('StoreType'):
+        fig.add_trace(go.Scatter(
+            x=part['Year'], y=part['Revenue'], name=channel, mode='lines+markers',
+            line=dict(width=2, color=channel_color[channel]), marker=dict(size=8),
+            hovertemplate=f'<b>{channel}</b><br>%{{x}}: $%{{y:,.0f}}<extra></extra>'))
+    fig.update_xaxes(dtick=1)
+    fig.update_yaxes(tickprefix='$', tickformat='~s', rangemode='tozero')
+    st.plotly_chart(style_chart(fig, 'Revenue by year and channel'), use_container_width=True)
+    table_view(by_year.rename(columns={'StoreType': 'Channel'}))
+
+    left, right = st.columns(2)
+
+    # Chart 2: which product categories bring in the money?
+    with left:
+        by_cat = analytics.revenue_by_category(view).iloc[::-1]  # largest at the top
+        fig = go.Figure(go.Bar(
+            x=by_cat['Revenue'], y=by_cat['Category'], orientation='h',
+            marker_color=BAR_COLOR, customdata=by_cat['Share'],
+            text=[f'${v / 1e6:,.1f}M · {s:.0%}' for v, s in zip(by_cat['Revenue'], by_cat['Share'])],
+            textposition='outside', cliponaxis=False,
+            hovertemplate='<b>%{y}</b><br>$%{x:,.0f} (%{customdata:.1%} of selection)<extra></extra>'))
+        fig.update_xaxes(tickprefix='$', tickformat='~s', showgrid=True,
+                         gridcolor='rgba(128,128,128,0.2)')
+        st.plotly_chart(style_chart(fig, 'Revenue by category'), use_container_width=True)
+        table_view(by_cat.iloc[::-1])
+
+    # Chart 3: when in the year does revenue come in?
+    with right:
+        by_month = analytics.revenue_by_month(view)
+        fig = go.Figure(go.Bar(
+            x=by_month['Month'], y=by_month['Revenue'], marker_color=BAR_COLOR,
+            customdata=by_month['Share'],
+            hovertemplate='<b>%{x}</b><br>$%{y:,.0f} (%{customdata:.1%} of selection)<extra></extra>'))
+        fig.update_yaxes(tickprefix='$', tickformat='~s')
+        st.plotly_chart(style_chart(fig, 'Revenue by month (selected years combined)'),
+                        use_container_width=True)
+        table_view(by_month)
+
 
 tab_data, tab_revenue, tab_dash, tab_assistant = st.tabs(
     ['Data and quality', 'Revenue and merge checks', 'Dashboard', 'Assistant'])
@@ -123,8 +238,7 @@ with tab_revenue:
         st.success('All joins kept the same rows and the same revenue total.')
 
 with tab_dash:
-    st.info('TODO: KPIs, filters, and at least three charts go here. '
-            'Calculate everything from the loaded data. Never hardcode results.')
+    render_dashboard()
 
 with tab_assistant:
     st.caption('Mode: rules-based starter. Describe what you actually built here.')
