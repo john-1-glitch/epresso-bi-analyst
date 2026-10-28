@@ -4,3 +4,12 @@
 __pycache__/
 .pytest_cache/
 .venv/
+
+# Course data and Power BI files stay local (this repo is public).
+# The app works from files uploaded in the browser.
+data/raw/*
+!data/raw/.gitkeep
+data/exported/
+*.pbix
+.claude/
+.DS_Store
