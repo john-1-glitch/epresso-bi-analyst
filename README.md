@@ -12,15 +12,15 @@ The app may take a moment to wake up if nobody has used it recently. It starts e
 
 ## How to use it
 
-Upload one file per table in the sidebar. The app checks each file for the columns it needs and names any missing column instead of crashing.
+Upload the original course files in the sidebar. The quickest way is three files: the Access database fills Sales, Categories and Products at once.
 
-| Upload box | File used for this project | Notes |
+| Upload box | File | Notes |
 |---|---|---|
-| Sales | `Sales.csv` | Exported from `Support_EX_B_Sales.accdb` with `scripts/export_access.py` |
+| Sales | `Support_EX_B_Sales.accdb` | The app reads the Sales, Categories and Products tables from the database |
 | Stores | `Support_EX_B_Stores.csv` | Tab-separated; the app detects the delimiter |
-| Categories | `Categories.csv` | Exported from the Access database |
-| Products | `Products.csv` | Exported from the Access database |
 | Survey Results (optional) | `Support_EX_B_Survey.xlsx` | The app finds the "Survey Results" sheet and its header row on its own |
+
+CSV or Excel exports also work, one per table (for example `Sales.csv`, `Categories.csv` and `Products.csv` made with `scripts/export_access.py`). In a workbook or database, the app uses the sheet or table that has the required columns. It names any missing column instead of crashing, and an updated file with added or removed rows, blanks, or new stores, years or categories is recalculated without code changes.
 
 The app has four tabs. **Data and quality** shows the grain of each table, a data quality summary and a profile of any table. **Revenue and merge checks** shows total revenue, revenue by year and the result of every join. **Dashboard** has Year, Channel, Store and Category filters (all built from the loaded data), three KPIs and three charts, each with a table view. **Assistant** answers questions, up to 15 per session.
 
@@ -48,10 +48,11 @@ Revenue is not profit. The data has no costs, discounts or margins, so nothing i
 
 ## Assistant
 
-The assistant can run in two modes, and every answer says which one answered.
+We built **Option A, a live language-model agent** using Google Gemini with function calling, with the rules-based assistant (Option B) as its automatic fallback. Every answer says which one answered.
 
-- **Gemini mode (when `GEMINI_API_KEY` is set):** Gemini reads the question and chooses one approved function and its arguments through function calling in `VALIDATED` mode, which constrains it to the listed functions and their schemas. Gemini never sees the data and never writes a number. Our code runs the function and builds the answer from its result.
-- **Rules-based mode (no key, or Gemini fails):** keyword rules choose the function. If Gemini hits a quota limit, a server error or a bad key, the rules router answers automatically and the answer shows a note saying so.
+- **Gemini mode (when `GEMINI_API_KEY` is set):** Gemini reads the question and chooses one approved function and its arguments through function calling in `VALIDATED` mode, which constrains it to the listed functions and their schemas. Our code runs the function on the loaded data. Gemini then writes Findings, Interpretation and Next steps from the tool result. Before the app shows that text, it checks every number in it against the tool result (allowing for rounding, millions and percentages); if any number cannot be traced, the app shows the standard answer instead and says why. Gemini never sees the data itself.
+- **Backup model:** the free tier allows about 20 requests per model per day and the main model (`gemini-3.5-flash`) is sometimes overloaded. On a 429 or 503 error the app retries once on `gemini-3.5-flash-lite`.
+- **Rules-based mode (no key, or Gemini still fails):** keyword rules choose the function and a template writes the answer from the result. The answer shows a note explaining the switch.
 
 | Tool | What it calculates | Arguments |
 |---|---|---|
@@ -60,41 +61,49 @@ The assistant can run in two modes, and every answer says which one answered.
 | `revenue_by_category` | Revenue and share for each product category | year, channel, store |
 | `revenue_by_channel` | Revenue and share for Website vs Brick & Mortar | year, store |
 | `top_stores` | The n stores with the most revenue, with shares | year, channel, n |
+| `revenue_change_by_store` | Each store's change between two years, the largest % decline and growth, or a plain statement that no store declined | start_year, end_year, channel |
+| `revenue_change_by_channel` | Each channel's change between two years and which grew the most | start_year, end_year, store |
+| `satisfaction_vs_revenue` | Correlation between store-year revenue and survey satisfaction, excluding store-years without a score | year |
 | `data_quality_report` | Rows, duplicates and missing values | none |
 
-Every tool checks its arguments against the loaded data and returns a clear error for an unknown year, channel or store, or for a city that matches two stores; it never guesses. Every result follows the same contract: `tool`, `value`, `definition`, `scope`, `rows_used` and `caveats`. Each answer starts with its scope, then shows Findings (numbers from the tool result only), Interpretation, Next steps and an expandable tool-call log with the raw result.
+Every tool checks its arguments against the loaded data and returns a clear error for an unknown year, channel or store, or for a city that matches two stores; it never guesses. Every result follows the same contract: `tool`, `value`, `definition`, `scope`, `rows_used` and `caveats`. Each answer starts with its scope and says it uses the full loaded dataset; if dashboard filters are set, the Assistant tab says they do not apply. Then come Findings, Interpretation, Next steps and an expandable tool-call log with the function, arguments, raw result and which model answered. Sessions are limited to 15 questions.
 
-**What the assistant is not allowed to do:** it cannot run or write code, use `eval()` or `exec()`, write SQL or pandas, change the loaded data, or answer questions the data cannot support. Questions about profit, causes ("why"), forecasts or customers are refused before any model is called, with the reason and a list of what it can answer.
+**Limits it enforces:** profit, margin, forecast and customer-level questions are refused before any model is called, with the reason and a list of what it can answer. "Why" and "does X cause Y" questions get the relevant evidence plus a statement that the data shows association, not cause. "Should we..." questions get the evidence, "No recommendation is supported by this data", and the information a decision would need (expenses, profitability, leases, staffing, customer behavior). Scope, caveats and these limits are written by our code, not by the model.
+
+**What it is not allowed to do:** run or write code, use `eval()` or `exec()`, write SQL or pandas, change the loaded data, or state a number our functions did not calculate.
 
 ## Validation
 
-**Power BI comparison.** The data model inside the Power BI report (`Fleischnamnn_Mey_NP_EX_B_EPresso.pbix`) was read directly and compared with the app's numbers. They match exactly: total revenue is $42,174,440, every year matches (2025: $7,181,750 through 2029: $9,181,550), and all 25,200 sales rows have identical revenue. Details: [`docs/powerbi_reconciliation.md`](docs/powerbi_reconciliation.md).
+Full evidence: [`docs/validation.md`](docs/validation.md) (Power BI table, independent check, $1,000 test record) and [`docs/agent_tests.md`](docs/agent_tests.md) (five agent tests, two documented fixes with retests).
 
-**Independent check.** Revenue was summed separately from the original Access database, from the exported CSV and from the Power BI model. All three agree, and the monthly shares match the Power BI column chart (for example, December is 25.61% of revenue).
+**Power BI comparison.** All five required measures plus revenue by category match our Power BI report exactly: total $42,174,440, Website $27,218,880, Brick & Mortar $14,955,560, every year, and every month's share (December is 25.61%). All 25,200 sales rows are identical row by row. One difference in design is documented: Power BI links Sales to Stores through the survey table, while the app joins Sales to Stores directly. Details: [`docs/powerbi_reconciliation.md`](docs/powerbi_reconciliation.md).
 
-**$1,000 test.** Adding $1,000 to one Sales row and uploading the changed file raises total revenue to exactly $42,175,440 without restarting the app, because the cache is keyed on each file's contents.
+**Independent check.** `scripts/independent_check.py` recalculates every measure with plain pandas and none of the app's code. It gives the same results.
 
-**Automated tests.** 59 tests in `tests/` run on a six-row dataset whose answers are worked out by hand in the test file. They cover totals, merge checks (including a duplicated store key and an unknown store), missing columns, Excel header detection, filters, every assistant tool, the dispatcher, both routers and the Gemini fallback (with a fake client, so the tests run offline).
+**$1,000 test.** Adding $1,000 to Sales row S0020250101 and uploading the copy in the same session raised the total to exactly $42,175,440. The Website 2025 chart point, the January bar, the Beans bar and the 2025 + Website filter each rose by $1,000, while Brick & Mortar, 2026 and store SH01 did not change. The assistant's answer moved by $1,000. There were no code changes and no restart, because the cache is keyed on each file's contents.
+
+**Automated tests.** 83 tests in `tests/` run on a six-row dataset whose answers are worked out by hand in the test file. They cover totals, merge checks (including a duplicated store key and an unknown store), missing columns, Excel header detection and Access upload, filters, every assistant tool, the dispatcher, both routers, the number check, the backup model and the Gemini fallback (with a fake client, so the tests run offline).
 
 ## Limitations
 
 - **Revenue is not profit.** There are no costs or margins, so the app cannot say which stores or products are most profitable.
-- **No causes.** The data shows what happened, not why. For example, website revenue more than doubled while in-store revenue fell, but the data cannot say why.
+- **No causes.** The data shows what happened and what moves together, not why. For example, website revenue more than doubled while in-store revenue fell, but the data cannot say why.
 - **Monthly totals only.** Sales are monthly totals per store and product, so there is no customer, transaction or daily detail.
 - **Channel is a mapping.** The data has no channel column; channel is the store type, and the website is treated as one store.
-- **Survey data is shown, not modeled.** Satisfaction scores are profiled but not used to explain revenue.
-- **Gemini availability.** The free Gemini tier allows only a few requests per minute and is sometimes busy; the rules-based assistant then answers instead.
+- **Satisfaction is thin evidence.** It is one annual score per store, the website is not surveyed, and the correlation with revenue is weak (0.235).
+- **Gemini availability.** The free tier allows about 20 requests per model per day, and each question uses two. When both models are out of quota or busy, the rules-based assistant answers.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `streamlit_app.py` | Screen layout and interaction |
-| `analytics.py` | Loading, cleaning, merge checks, metrics and analytical tools (no Streamlit code) |
-| `agent.py` | Tool registry, dispatcher, rules router and Gemini router |
+| `analytics.py` | Loading (CSV, Excel, Access), cleaning, merge checks, metrics and analytical tools (no Streamlit code) |
+| `agent.py` | Tool registry, dispatcher, rules router, Gemini router and explanation, number check |
 | `tests/` | Tests with hand-checkable answers |
-| `scripts/export_access.py` | One-off export of the Access tables to CSV |
-| `docs/` | Data profile, grain statements and Power BI reconciliation |
+| `scripts/export_access.py` | Export of the Access tables to CSV |
+| `scripts/independent_check.py` | Independent recalculation of the validation measures with plain pandas |
+| `docs/` | Data profile, Power BI reconciliation, validation evidence, agent tests, reflection draft, team contribution |
 | `requirements.txt` | Packages the hosted app needs |
 
 ## Run it
