@@ -6,7 +6,9 @@ E-Presso BI Analyst lets a manager upload the company's sales, store and survey 
 
 ## Live app
 
-_Add the Streamlit Community Cloud URL here after deploying._ The app may take a moment to wake up if nobody has used it recently.
+**[epreapp-bi-analyst-zx7d5bv7vmsnm3q3prkxfs.streamlit.app](https://epreapp-bi-analyst-zx7d5bv7vmsnm3q3prkxfs.streamlit.app/)**
+
+The app may take a moment to wake up if nobody has used it recently. It starts empty: upload the files listed below to begin.
 
 ## How to use it
 
